@@ -32,5 +32,13 @@
   "confirm_delete": "Confirm send to Trash?",
   "yes": "Yes",
   "no": "No",
-  "cancel": "Cancel"
+  "cancel": "Cancel",
+  "send2trash_missing": "Error: send2trash is not installed",
+  "delete_cancelled": "Action cancelled",
+  "delete_result_success": "Sent {total} items to Trash",
+  "delete_result_partial": "Sent {processed} of {total} items to Trash",
+  "confirm_shortcuts": "Keys: Y = Yes · N = No · Esc = Cancel",
+  "sending_to_trash": "Sending to Trash...",
+  "delete_in_progress": "Trash operation already in progress, please wait...",
+  "delete_error_detail": "Error on {path}: {error}"
 }

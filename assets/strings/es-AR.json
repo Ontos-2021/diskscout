@@ -32,5 +32,13 @@
   "confirm_delete": "¿Confirmar envío a Papelera?",
   "yes": "Sí",
   "no": "No",
-  "cancel": "Cancelar"
+  "cancel": "Cancelar",
+  "send2trash_missing": "Error: send2trash no está instalado",
+  "delete_cancelled": "Acción cancelada",
+  "delete_result_success": "Enviados {total} elementos a la Papelera",
+  "delete_result_partial": "Se enviaron {processed} de {total} elementos a la Papelera",
+  "confirm_shortcuts": "Teclas: S/Y = Sí · N = No · Esc = Cancelar",
+  "sending_to_trash": "Enviando a la Papelera...",
+  "delete_in_progress": "Envío a la Papelera en curso, espera...",
+  "delete_error_detail": "Error en {path}: {error}"
 }

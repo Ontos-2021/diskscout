@@ -41,6 +41,7 @@ def main():
     # tui
     tui_parser = subparsers.add_parser('tui', help='Launch TUI')
     tui_parser.add_argument('path', help='Directory to scan')
+    tui_parser.add_argument('--lang', default='es-AR', help='Language code (e.g. es-AR, en-US)')
 
     args = parser.parse_args()
 
@@ -94,7 +95,7 @@ def main():
 
     elif args.command == 'tui':
         from tui.app import DiskScoutApp
-        app = DiskScoutApp(args.path)
+        app = DiskScoutApp(args.path, lang=args.lang)
         app.run()
 
 if __name__ == '__main__':

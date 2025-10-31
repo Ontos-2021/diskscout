@@ -1,3 +1,3 @@
 venv/
 __pycache__/
-tui.log*.pyc
+tui.log
