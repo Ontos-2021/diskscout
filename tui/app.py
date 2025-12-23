@@ -9,10 +9,9 @@ import asyncio
 import json
 import os
 import sys
-from functools import partial
 from pathlib import Path
 import logging
-from typing import Optional
+from typing import Optional, Tuple
 
 logger = logging.getLogger("DiskScoutTUI")
 if not logger.handlers:
@@ -22,6 +21,21 @@ if not logger.handlers:
     logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 logger.propagate = False
+
+if os.name == "nt":
+    import ctypes
+    import winreg
+
+    class SHQUERYRBINFO(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", ctypes.c_ulong),
+            ("i64Size", ctypes.c_longlong),
+            ("i64NumItems", ctypes.c_longlong),
+        ]
+else:  # pragma: no cover - non-Windows fallback
+    ctypes = None  # type: ignore[assignment]
+    winreg = None  # type: ignore[assignment]
+    SHQUERYRBINFO = None
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -84,6 +98,66 @@ class ConfirmDeletionModal(ModalScreen[bool]):
     def action_cancel(self) -> None:
         logger.info("Modal cancel action triggered")
         self.dismiss(False)
+
+
+class MixedDeletionModal(ModalScreen[str]):
+    """Modal con tres opciones para casos mixtos: borrar todo, sólo lo que entra o cancelar."""
+
+    BINDINGS = [
+        Binding("y", "choose_all", "", show=False),
+        Binding("s", "choose_all", "", show=False),
+        Binding("f", "choose_fit", "", show=False),
+        Binding("n", "cancel", "", show=False),
+        Binding("escape", "cancel", "", show=False),
+    ]
+
+    def __init__(self, message: str, strings: dict):
+        super().__init__()
+        self.message = message
+        self.strings = strings
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(
+            Static(self.message, id="confirm_message"),
+            Static(
+                self.strings.get(
+                    "mixed_shortcuts",
+                    "Teclas: S/Y = Todo · F = Sólo los que entran · N = No · Esc = Cancelar",
+                ),
+                id="confirm_shortcuts",
+            ),
+            Horizontal(
+                Button(self.strings.get("yes", "Sí"), id="confirm_all", variant="success"),
+                Button(self.strings.get("only_fit", "Sólo los que entran"), id="confirm_fit", variant="warning"),
+                Button(self.strings.get("no", "No"), id="confirm_no", variant="primary"),
+                id="confirm_buttons",
+            ),
+            id="confirm_container",
+        )
+
+    def on_mount(self) -> None:
+        self.query_one("#confirm_all", Button).focus()
+
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        logger.info("Mixed modal button pressed: %s", event.button.id)
+        if event.button.id == "confirm_all":
+            self.dismiss("all")
+        elif event.button.id == "confirm_fit":
+            self.dismiss("fit")
+        else:
+            self.dismiss("cancel")
+
+    def action_choose_all(self) -> None:
+        logger.info("Mixed modal choose_all action")
+        self.dismiss("all")
+
+    def action_choose_fit(self) -> None:
+        logger.info("Mixed modal choose_fit action")
+        self.dismiss("fit")
+
+    def action_cancel(self) -> None:
+        logger.info("Mixed modal cancel action")
+        self.dismiss("cancel")
 
 
 class DirectoryItem(ListItem):
@@ -169,6 +243,7 @@ class DiskScoutApp(App):
         self.current_max_size: int = 0
         self.deletion_task: Optional[asyncio.Task] = None
         self.last_deleted: list[Path] = []
+        self.awaiting_overflow_confirmation: bool = False
 
         logger.info("DiskScoutApp initialized root=%s lang=%s", self.root_path, self.lang)
 
@@ -249,6 +324,429 @@ class DiskScoutApp(App):
             return
         header.update(message)
 
+    def _query_recycle_bin(self, target: Optional[Path] = None) -> Optional[Tuple[int, int]]:
+        """Return (item_count, total_size) for the system Recycle Bin or a drive."""
+        if os.name != "nt" or SHQUERYRBINFO is None or ctypes is None:
+            return None
+        try:
+            info = SHQUERYRBINFO()
+            info.cbSize = ctypes.sizeof(SHQUERYRBINFO)
+            query_path = None
+            if target:
+                drive = target.drive or os.path.splitdrive(str(target))[0]
+                if drive:
+                    query_path = f"{drive.rstrip(':')}:\\"
+            result = ctypes.windll.shell32.SHQueryRecycleBinW(
+                query_path,
+                ctypes.byref(info),
+            )
+            if result != 0:
+                raise ctypes.WinError(result)
+            return (int(info.i64NumItems), int(info.i64Size))
+        except Exception as error:  # pragma: no cover - Windows-specific guard
+            logger.warning("Recycle bin query failed: %s", error)
+            return None
+
+    def _query_recycle_bin_multi(self, paths: list[Path]) -> Optional[Tuple[int, int]]:
+        """Return aggregated (item_count, total_size) across all drives involved in paths."""
+        if not paths:
+            return self._query_recycle_bin()
+        drives = []
+        for p in paths:
+            drive = p.drive or os.path.splitdrive(str(p))[0]
+            if drive and drive not in drives:
+                drives.append(drive)
+        total_items = 0
+        total_size = 0
+        for d in drives:
+            try:
+                info = SHQUERYRBINFO()
+                info.cbSize = ctypes.sizeof(SHQUERYRBINFO)
+                query_path = f"{d.rstrip(':')}:\\"
+                result = ctypes.windll.shell32.SHQueryRecycleBinW(
+                    query_path,
+                    ctypes.byref(info),
+                )
+                if result == 0:
+                    total_items += int(info.i64NumItems)
+                    total_size += int(info.i64Size)
+            except Exception:
+                continue
+        return (total_items, total_size)
+
+    def _get_drive_total_bytes(self, path: Path) -> Optional[int]:
+        if os.name != "nt" or ctypes is None:
+            return None
+        drive = path.drive or os.path.splitdrive(str(path))[0]
+        if not drive:
+            return None
+        root = f"{drive.rstrip(':')}:\\"
+        free_bytes_available = ctypes.c_ulonglong()
+        total_number_of_bytes = ctypes.c_ulonglong()
+        total_number_of_free_bytes = ctypes.c_ulonglong()
+        success = ctypes.windll.kernel32.GetDiskFreeSpaceExW(
+            ctypes.c_wchar_p(root),
+            ctypes.byref(free_bytes_available),
+            ctypes.byref(total_number_of_bytes),
+            ctypes.byref(total_number_of_free_bytes),
+        )
+        if success:
+            return int(total_number_of_bytes.value)
+        return None
+
+    def _get_volume_guid_for_path(self, path: Path) -> Optional[str]:
+        """Return the volume GUID path for the drive of 'path', e.g. \\?\Volume{GUID}\\.
+
+        Uses GetVolumeNameForVolumeMountPointW on the drive root (C:\\).
+        """
+        if os.name != "nt" or ctypes is None:
+            return None
+        drive = path.drive or os.path.splitdrive(str(path))[0]
+        if not drive:
+            return None
+        root = f"{drive.rstrip(':')}:\\"
+        buf_len = 128
+        buffer = ctypes.create_unicode_buffer(buf_len)
+        success = ctypes.windll.kernel32.GetVolumeNameForVolumeMountPointW(
+            ctypes.c_wchar_p(root), buffer, buf_len
+        )
+        if success:
+            guid = buffer.value
+            # Normalize: ensure trailing backslash removed for comparison uniformity
+            return guid.rstrip("\\").lower()
+        return None
+
+    def _get_recycle_bin_limit_bytes(self, path: Path, current_usage: int) -> Optional[int]:
+        if os.name != "nt" or winreg is None:
+            return None
+        drive = path.drive or os.path.splitdrive(str(path))[0]
+        if not drive:
+            return None
+        drive_root = f"{drive.rstrip(':')}:\\"
+        volume_guid = self._get_volume_guid_for_path(path)
+        found_limit = None
+
+        # Helper available across all branches in this method
+        def _decode_reg_value(val: object) -> str:
+            if isinstance(val, (bytes, bytearray)):
+                try:
+                    s = val.decode("utf-16-le", errors="ignore")
+                except Exception:
+                    try:
+                        s = val.decode(errors="ignore")  # type: ignore[arg-type]
+                    except Exception:
+                        s = ""
+                return s.split("\x00", 1)[0]
+            return str(val)
+
+        def _try_read_limit_from_key(key_handle, source_label: str) -> Optional[int]:
+            """Attempt to read NukeOnDelete/MaxCapacity or Percent from a given key.
+            Returns limit in bytes or 0 if NukeOnDelete, or None if not present.
+            """
+            # NukeOnDelete overrides everything
+            try:
+                nuke_on_delete, _ = winreg.QueryValueEx(key_handle, "NukeOnDelete")
+                if int(nuke_on_delete) == 1:
+                    logger.info("Recycle Bin (%s) configured to delete immediately for %s", source_label, drive_root)
+                    return 0
+            except FileNotFoundError:
+                pass
+
+            # Primary: MaxCapacity (MB)
+            max_capacity = None
+            try:
+                max_capacity, _ = winreg.QueryValueEx(key_handle, "MaxCapacity")
+            except FileNotFoundError:
+                max_capacity = None
+            if max_capacity is not None:
+                try:
+                    mc = int(max_capacity)
+                except Exception:
+                    mc = 0
+                if mc <= 0:
+                    return 0
+                limit_bytes = mc * 1024 * 1024
+                total_bytes = self._get_drive_total_bytes(path)
+                if total_bytes and limit_bytes > total_bytes:
+                    limit_bytes = total_bytes
+                logger.info(
+                    "Recycle Bin limit (MB) read from %s for %s: %s MB (~%s bytes)",
+                    source_label,
+                    drive_root,
+                    mc,
+                    limit_bytes,
+                )
+                return limit_bytes
+
+            # Fallback: Percent (0-100) if present on some systems
+            try:
+                percent, _ = winreg.QueryValueEx(key_handle, "Percent")
+                pct = int(percent)
+                if pct < 0:
+                    pct = 0
+                if pct > 100:
+                    pct = 100
+                total_bytes = self._get_drive_total_bytes(path)
+                if total_bytes:
+                    limit_bytes = (total_bytes * pct) // 100
+                    logger.info(
+                        "Recycle Bin limit (Percent=%s%%) read from %s for %s: ~%s bytes",
+                        pct,
+                        source_label,
+                        drive_root,
+                        limit_bytes,
+                    )
+                    return limit_bytes
+            except FileNotFoundError:
+                pass
+            return None
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\BitBucket\Volume",
+            ) as volumes_key:
+                index = 0
+                while True:
+                    try:
+                        subkey_name = winreg.EnumKey(volumes_key, index)
+                        index += 1
+                    except OSError:
+                        break
+                    try:
+                        with winreg.OpenKey(volumes_key, subkey_name) as volume_key:
+                            # Try matching via Volume GUID first (most reliable)
+                            volume_value = None
+                            try:
+                                volume_value, _ = winreg.QueryValueEx(volume_key, "Volume")
+                            except FileNotFoundError:
+                                volume_value = None
+                            matched = False
+                            if volume_guid and volume_value:
+                                vol_str = _decode_reg_value(volume_value).rstrip("\\").lower()
+                                if vol_str and vol_str == volume_guid:
+                                    matched = True
+
+                            # Fallback: match by MountPoint (e.g., C:\)
+                            if not matched:
+                                mount_point = None
+                                try:
+                                    mount_point, _ = winreg.QueryValueEx(volume_key, "MountPoint")
+                                except FileNotFoundError:
+                                    mount_point = None
+                                if mount_point:
+                                    mp_str = _decode_reg_value(mount_point)
+                                    if mp_str.lower().startswith(drive_root.lower()):
+                                        matched = True
+
+                            if not matched:
+                                continue
+                            limit = _try_read_limit_from_key(volume_key, "Volume")
+                            if limit is None:
+                                continue
+                            found_limit = limit
+                            raise StopIteration
+                    except OSError:
+                        continue
+        except FileNotFoundError:
+            pass
+        except StopIteration:
+            # Found via Volume
+            return found_limit
+
+        # Try BitBucket\Bins as a fallback (some systems store per-volume settings here)
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\BitBucket\Bins",
+            ) as bins_key:
+                index = 0
+                while True:
+                    try:
+                        subkey_name = winreg.EnumKey(bins_key, index)
+                        index += 1
+                    except OSError:
+                        break
+                    try:
+                        with winreg.OpenKey(bins_key, subkey_name) as bin_key:
+                            # The Bins structure sometimes nests user SIDs -> Volume GUIDs
+                            # Try the current key first, then any child keys.
+
+                            def _match_and_read_from(handle) -> Optional[int]:
+                                # Prefer matching Volume GUID, fallback to MountPoint
+                                volume_value = None
+                                try:
+                                    volume_value, _ = winreg.QueryValueEx(handle, "Volume")
+                                except FileNotFoundError:
+                                    volume_value = None
+
+                                matched = False
+                                if volume_guid and volume_value:
+                                    vol_str = _decode_reg_value(volume_value).rstrip("\\").lower()
+                                    if vol_str and vol_str == volume_guid:
+                                        matched = True
+                                if not matched:
+                                    try:
+                                        mount_point, _ = winreg.QueryValueEx(handle, "MountPoint")
+                                        mp_str = _decode_reg_value(mount_point)
+                                        if mp_str.lower().startswith(drive_root.lower()):
+                                            matched = True
+                                    except FileNotFoundError:
+                                        pass
+                                if not matched:
+                                    return None
+                                return _try_read_limit_from_key(handle, "Bins")
+
+                            # Try current key
+                            limit = _match_and_read_from(bin_key)
+                            if limit is not None:
+                                return limit
+
+                            # Enumerate child keys (e.g., SID -> Volume GUID)
+                            try:
+                                child_index = 0
+                                while True:
+                                    try:
+                                        child_name = winreg.EnumKey(bin_key, child_index)
+                                        child_index += 1
+                                    except OSError:
+                                        break
+                                    try:
+                                        with winreg.OpenKey(bin_key, child_name) as child_key:
+                                            limit = _match_and_read_from(child_key)
+                                            if limit is not None:
+                                                return limit
+                                    except OSError:
+                                        continue
+                            except OSError:
+                                pass
+                    except OSError:
+                        continue
+        except FileNotFoundError:
+            pass
+        total_bytes = self._get_drive_total_bytes(path)
+        if total_bytes is None:
+            return None
+        # Assume default Windows behavior (~5% of drive) if configuration not found.
+        approximate_limit = int(total_bytes * 0.05)
+        if approximate_limit <= 0:
+            return None
+        logger.info(
+            "Recycle Bin limit fallback (~5%% of drive) for %s: ~%s bytes (could not read Volume/Bins keys)",
+            drive_root,
+            approximate_limit,
+        )
+        return approximate_limit
+
+    def _evaluate_recycle_bin_risk(
+        self,
+        paths: list[Path],
+        total_size: int,
+    ) -> Optional[str]:
+        if os.name != "nt" or not paths:
+            return None
+        bin_stats = self._query_recycle_bin(paths[0])
+        if bin_stats is None:
+            return self.strings.get("recycle_bin_overflow_prompt_unknown")
+        _, current_usage = bin_stats
+        limit_bytes = self._get_recycle_bin_limit_bytes(paths[0], current_usage)
+        if limit_bytes is None:
+            return self.strings.get("recycle_bin_overflow_prompt_unknown")
+        if limit_bytes <= 0:
+            return self.strings.get("recycle_bin_overflow_prompt_unknown")
+        available = max(limit_bytes - current_usage, 0)
+        if total_size > available:
+            return self.strings.get(
+                "recycle_bin_overflow_prompt",
+                "Warning: the Recycle Bin may not have enough space.",
+            ).format(
+                available=format_size(available),
+                size=format_size(total_size),
+            )
+        return None
+
+    def _predict_recycle_bin_fit(
+        self,
+        paths: list[Path],
+    ) -> Optional[Tuple[list[Path], list[Path], int]]:
+        """Predict which of the given paths would fit in the Recycle Bin quota.
+
+        Returns (will_fit, overflow, available_bytes) or None if unknown.
+        """
+        if os.name != "nt" or not paths:
+            return None
+        bin_stats = self._query_recycle_bin(paths[0])
+        if bin_stats is None:
+            return None
+        _, current_usage = bin_stats
+        limit_bytes = self._get_recycle_bin_limit_bytes(paths[0], current_usage)
+        if limit_bytes is None or limit_bytes <= 0:
+            return None
+        available = max(limit_bytes - current_usage, 0)
+        logger.info(
+            "Recycle bin fit prediction: current_usage=%s limit=%s available=%s for %s items",
+            current_usage,
+            limit_bytes,
+            available,
+            len(paths),
+        )
+
+        # Build a size map from current listing, fallback to stat/scan
+        size_map: dict[Path, int] = {}
+        for item in self.current_items:
+            size_map[item['path'].resolve()] = int(item['size'])
+
+        def get_size(p: Path) -> int:
+            rp = p.resolve()
+            if rp in size_map:
+                return size_map[rp]
+            try:
+                if rp.is_dir():
+                    return int(DiskScanner().scan(str(rp))['total_size'])
+                return int(rp.stat().st_size)
+            except Exception:
+                return 0
+
+        ordered = sorted(paths, key=lambda p: get_size(p))  # small first to maximize fit
+        will_fit: list[Path] = []
+        overflow: list[Path] = []
+        remaining = available
+        for p in ordered:
+            sz = get_size(p)
+            if sz <= remaining:
+                will_fit.append(p)
+                remaining -= sz
+            else:
+                overflow.append(p)
+        return (will_fit, overflow, available)
+
+    def _get_path_size_cached(self, p: Path) -> int:
+        """Return size for a path using current_items cache, falling back to stat/scan."""
+        rp = p.resolve()
+        for item in self.current_items:
+            if item['path'].resolve() == rp:
+                return int(item['size'])
+        try:
+            if rp.is_dir():
+                return int(DiskScanner().scan(str(rp))['total_size'])
+            return int(rp.stat().st_size)
+        except Exception:
+            return 0
+
+    def _start_deletion(self, items_to_delete: list[Path], total_size: int) -> None:
+        self.deleting = True
+        self._update_header(
+            self.strings.get(
+                "sending_to_trash",
+                "Enviando a la Papelera...",
+            )
+        )
+        logger.info("Starting deletion for %s files", len(items_to_delete))
+        if self.deletion_task and not self.deletion_task.done():
+            self.deletion_task.cancel()
+        self.deletion_task = asyncio.create_task(
+            self._perform_deletion(items_to_delete, total_size)
+        )
+
     def _prune_deleted_items(self, deleted_paths: list[Path]) -> None:
         """Remove deleted entries from the current list so the UI reflects the change."""
         if not deleted_paths:
@@ -314,7 +812,7 @@ class DiskScoutApp(App):
         if not self.selected_indices:
             logger.info("No items selected; action aborted")
             return
-        if self.deleting:
+        if self.deleting or self.awaiting_overflow_confirmation:
             logger.warning("Deletion already in progress")
             self._update_header(
                 self.strings.get(
@@ -338,11 +836,99 @@ class DiskScoutApp(App):
             len(items_to_delete),
             format_size(total_size),
         )
-        confirm_message = (
-            f"{self.strings['confirm_delete']}\n"
-            f"{len(items_to_delete)} · {format_size(total_size)}"
-        )
-        
+        # Build an informed confirmation message BEFORE asking the user
+        # so the user sees mixed/overflow/marginal risks up front.
+        confirm_message: str
+        prediction = self._predict_recycle_bin_fit(items_to_delete)
+        if prediction is not None:
+            will_fit, overflow, available = prediction
+            if will_fit and overflow:
+                preview_names = ", ".join(p.name for p in overflow[:3])
+                if len(overflow) > 3:
+                    preview_names += f" +{len(overflow) - 3}"
+                # Compute total sizes for each group for display
+                fit_size_total = sum(self._get_path_size_cached(p) for p in will_fit)
+                overflow_size_total = sum(self._get_path_size_cached(p) for p in overflow)
+                confirm_message = self.strings.get(
+                    "recycle_bin_mixed_prompt",
+                    "Heads up: {fit} of {total} items would fit; {overflow} may be deleted.",
+                ).format(
+                    fit=len(will_fit),
+                    total=len(items_to_delete),
+                    overflow=len(overflow),
+                    preview=preview_names,
+                    fit_size=format_size(fit_size_total),
+                    overflow_size=format_size(overflow_size_total),
+                )
+                # Push the mixed modal with three options and return early.
+                def handle_mixed(choice: Optional[str]) -> None:
+                    logger.info("Mixed choice result=%s", choice)
+                    if choice == "fit":
+                        paths_fit = will_fit
+                        size_fit = sum(self._get_path_size_cached(p) for p in paths_fit)
+                        if not paths_fit:
+                            self._update_header(self.strings.get("delete_cancelled", "Acción cancelada"))
+                            return
+                        self._start_deletion(paths_fit, size_fit)
+                        return
+                    elif choice == "all":
+                        self._start_deletion(items_to_delete, total_size)
+                        return
+                    else:
+                        self._update_header(self.strings.get("delete_cancelled", "Acción cancelada"))
+                        return
+
+                self.push_screen(
+                    MixedDeletionModal(confirm_message, self.strings),
+                    handle_mixed,
+                )
+                return
+            elif overflow and not will_fit:
+                # None would fit: treat as overflow warn
+                confirm_message = self.strings.get(
+                    "recycle_bin_overflow_prompt",
+                    "Warning: the Recycle Bin may not have enough space.",
+                ).format(
+                    available=format_size(max(available, 0)),
+                    size=format_size(total_size),
+                )
+            elif will_fit and not overflow:
+                # All fit, but maybe with a very small margin
+                margin = max(available - total_size, 0)
+                margin_threshold = 64 * 1024 * 1024  # 64 MiB safety margin
+                logger.info(
+                    "Recycle bin margin check (pre-confirm): available=%s total_size=%s margin=%s threshold=%s",
+                    available,
+                    total_size,
+                    margin,
+                    margin_threshold,
+                )
+                if margin <= margin_threshold:
+                    confirm_message = self.strings.get(
+                        "recycle_bin_marginal_prompt",
+                        "Heads up: the Recycle Bin would have very little free space left ({margin}). Continue?",
+                    ).format(margin=format_size(margin))
+                else:
+                    confirm_message = (
+                        f"{self.strings['confirm_delete']}\n"
+                        f"{len(items_to_delete)} · {format_size(total_size)}"
+                    )
+            else:
+                confirm_message = (
+                    f"{self.strings['confirm_delete']}\n"
+                    f"{len(items_to_delete)} · {format_size(total_size)}"
+                )
+        else:
+            # Fallback to coarse check (unknown space or API not available)
+            overflow_warning = self._evaluate_recycle_bin_risk(items_to_delete, total_size)
+            if overflow_warning:
+                confirm_message = overflow_warning
+            else:
+                confirm_message = (
+                    f"{self.strings['confirm_delete']}\n"
+                    f"{len(items_to_delete)} · {format_size(total_size)}"
+                )
+
         def handle_confirmation(confirmed: Optional[bool]) -> None:
             logger.info("Deletion confirmation result=%s", confirmed)
             if confirmed is not True:
@@ -351,43 +937,52 @@ class DiskScoutApp(App):
                     self.strings.get("delete_cancelled", "Acción cancelada")
                 )
                 return
-
-            self.deleting = True
-            self._update_header(
-                self.strings.get(
-                    "sending_to_trash",
-                    "Enviando a la Papelera...",
-                )
-            )
-            logger.info("Starting deletion for %s files", len(items_to_delete))
-            if self.deletion_task and not self.deletion_task.done():
-                self.deletion_task.cancel()
-            self.deletion_task = asyncio.create_task(
-                self._perform_deletion(items_to_delete)
-            )
+            self._start_deletion(items_to_delete, total_size)
         
         self.push_screen(
             ConfirmDeletionModal(confirm_message, self.strings),
             handle_confirmation
         )
     
-    async def _perform_deletion(self, paths: list[Path]) -> None:
+    async def _perform_deletion(self, paths: list[Path], expected_total_size: int) -> None:
+        before_stats = self._query_recycle_bin_multi(paths)
         try:
             successes, failures = await asyncio.to_thread(self._send_to_trash, paths)
         except Exception as error:  # pragma: no cover - defensive safeguard
             logger.exception("Unexpected error during deletion task")
-            self._handle_deletion_complete([], [(Path("?"), str(error))], len(paths))
+            self._handle_deletion_complete(
+                [],
+                [(Path("?"), str(error))],
+                len(paths),
+                0,
+                before_stats,
+                self._query_recycle_bin_multi(paths),
+            )
             return
-        self._handle_deletion_complete(successes, failures, len(paths))
+
+        after_stats = self._query_recycle_bin_multi(paths)
+        self._handle_deletion_complete(
+            successes,
+            failures,
+            len(paths),
+            expected_total_size,
+            before_stats,
+            after_stats,
+        )
 
     def _handle_deletion_complete(
         self,
         successes: list[Path],
         failures: list[tuple[Path, str]],
         total: int,
+        expected_total_size: int,
+        before_stats: Optional[Tuple[int, int]],
+        after_stats: Optional[Tuple[int, int]],
+        all_paths: Optional[list[Path]] = None,
     ) -> None:
         self.deleting = False
         self.deletion_task = None
+        self.awaiting_overflow_confirmation = False
         processed = len(successes)
         logger.info(
             "Deletion worker finished: processed=%s failures=%s",
@@ -427,17 +1022,80 @@ class DiskScoutApp(App):
             message = f"{message} · {detail_template.format(path=str(failed_path), error=error_message)}"
 
         self._update_header(message)
+        potential_bin_issue = False
+        suspected_count = 0
+        if (
+            processed
+            and expected_total_size > 0
+            and before_stats
+            and after_stats
+        ):
+            before_items, before_size = before_stats
+            after_items, after_size = after_stats
+            size_delta = after_size - before_size
+            items_delta = after_items - before_items
+            threshold = max(int(expected_total_size * 0.1), 1)
+            if size_delta < threshold or items_delta < processed:
+                potential_bin_issue = True
+                suspected_count = max(processed - max(items_delta, 0), 1)
+                logger.warning(
+                    "Recycle bin delta smaller than expected (expected=%s, delta=%s, items_delta=%s)",
+                    expected_total_size,
+                    size_delta,
+                    items_delta,
+                )
+
+        if potential_bin_issue:
+            if suspected_count and suspected_count < processed:
+                warning_message = self.strings.get(
+                    "recycle_bin_space_warning_some",
+                    "Warning: {suspected} of {processed} items may have been permanently deleted.",
+                ).format(suspected=suspected_count, processed=processed)
+                warning_short = self.strings.get(
+                    "recycle_bin_space_warning_some_short",
+                    "Warning: possible permanent deletion of {suspected} of {processed}.",
+                ).format(suspected=suspected_count, processed=processed)
+            else:
+                warning_message = self.strings.get(
+                    "recycle_bin_space_warning",
+                    "Warning: Recycle Bin may have skipped some items.",
+                )
+                warning_short = self.strings.get(
+                    "recycle_bin_space_warning_short",
+                    "Warning: Windows may have deleted items permanently.",
+                )
+            message = f"{message} · {warning_short}"
 
         if processed:
+            # If we suspect some items were permanently deleted, try to infer which ones
+            suspect_preview = ""
+            if potential_bin_issue and suspected_count:
+                # Heuristic: the largest N are more likely to have been skipped by the bin
+                sized_successes = [
+                    (p, self._get_path_size_cached(p)) for p in successes
+                ]
+                sized_successes.sort(key=lambda t: t[1], reverse=True)
+                suspect_paths = [p for p, _ in sized_successes[:suspected_count]]
+                suspect_preview = ", ".join(p.name for p in suspect_paths[:3])
+                if len(suspect_paths) > 3:
+                    suspect_preview += f" +{len(suspect_paths) - 3}"
+
             names_preview = ", ".join(path.name for path in successes[:3])
             if len(successes) > 3:
                 names_preview += f" +{len(successes) - 3}"
-            severity = "warning" if failures else "information"
-            self.notify(
-                f"{message}\n{names_preview}",
-                severity=severity,
-                timeout=6,
-            )
+            severity = "warning" if failures or potential_bin_issue else "information"
+            if suspect_preview:
+                self.notify(
+                    f"{message}\n{self.strings.get('suspected_permanent', 'Sospechoso permanente')}: {suspect_preview}",
+                    severity=severity,
+                    timeout=8,
+                )
+            else:
+                self.notify(
+                    f"{message}\n{names_preview}",
+                    severity=severity,
+                    timeout=6,
+                )
         elif failures:
             failed_preview = ", ".join(path.name for path, _ in failures[:3])
             self.notify(
@@ -445,6 +1103,8 @@ class DiskScoutApp(App):
                 severity="error",
                 timeout=6,
             )
+        if potential_bin_issue:
+            self.notify(warning_message, severity="warning", timeout=8)
 
         if not successes:
             self.selected_indices.clear()

@@ -40,5 +40,17 @@
   "confirm_shortcuts": "Keys: Y = Yes · N = No · Esc = Cancel",
   "sending_to_trash": "Sending to Trash...",
   "delete_in_progress": "Trash operation already in progress, please wait...",
-  "delete_error_detail": "Error on {path}: {error}"
+  "delete_error_detail": "Error on {path}: {error}",
+  "recycle_bin_space_warning": "Warning: Windows may have deleted some items permanently because the Recycle Bin had no room left.",
+  "recycle_bin_space_warning_short": "Warning: Windows may have deleted items permanently.",
+  "recycle_bin_space_warning_some": "Warning: {suspected} of {processed} items may have been permanently deleted.",
+  "recycle_bin_space_warning_some_short": "Warning: possible permanent deletion of {suspected} of {processed}.",
+  "recycle_bin_overflow_prompt": "Warning: the Recycle Bin only has {available} free and you are about to delete {size}. If you continue, Windows may delete the content permanently. Continue anyway?",
+  "recycle_bin_overflow_prompt_unknown": "Could not verify Recycle Bin space. If you continue, Windows may delete the content permanently. Continue anyway?"
+
+  ,"recycle_bin_mixed_prompt": "Heads up: {fit} of {total} items would fit (~{fit_size}). The other {overflow} (~{overflow_size}) may be permanently deleted. Continue? {preview}"
+  ,"recycle_bin_marginal_prompt": "Heads up: the Recycle Bin would have very little free space left ({margin}). Windows may skip the bin and delete permanently. Continue?"
+  ,"only_fit": "Only those that fit"
+  ,"mixed_shortcuts": "Keys: Y = All · F = Only fit · N = No · Esc = Cancel"
+  ,"suspected_permanent": "Suspected permanent"
 }

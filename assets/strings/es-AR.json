@@ -40,5 +40,17 @@
   "confirm_shortcuts": "Teclas: S/Y = Sí · N = No · Esc = Cancelar",
   "sending_to_trash": "Enviando a la Papelera...",
   "delete_in_progress": "Envío a la Papelera en curso, espera...",
-  "delete_error_detail": "Error en {path}: {error}"
+  "delete_error_detail": "Error en {path}: {error}",
+  "recycle_bin_space_warning": "Advertencia: la Papelera parece no haber aceptado todo. Windows podría haber borrado elementos de forma permanente.",
+  "recycle_bin_space_warning_short": "Advertencia: Windows podría haber borrado elementos de forma permanente.",
+  "recycle_bin_space_warning_some": "Advertencia: {suspected} de {processed} elementos podrían haberse borrado de forma permanente.",
+  "recycle_bin_space_warning_some_short": "Advertencia: posible eliminación permanente de {suspected} de {processed}.",
+  "recycle_bin_overflow_prompt": "Advertencia: la Papelera sólo tiene {available} libres y vas a borrar {size}. Si continúas, Windows podría eliminar el contenido de forma permanente. ¿Quieres continuar?",
+  "recycle_bin_overflow_prompt_unknown": "No pude verificar el espacio de la Papelera. Si continúas, Windows podría eliminar el contenido de forma permanente. ¿Quieres continuar?"
+
+  ,"recycle_bin_mixed_prompt": "Atención: {fit} de {total} elementos entrarían en la Papelera (~{fit_size}). Los otros {overflow} (~{overflow_size}) podrían borrarse definitivamente. ¿Quieres continuar? {preview}"
+  ,"recycle_bin_marginal_prompt": "Atención: la Papelera quedaría con muy poco espacio libre ({margin}). Es posible que Windows omita la Papelera y borre permanentemente. ¿Quieres continuar?"
+  ,"only_fit": "Sólo los que entran"
+  ,"mixed_shortcuts": "Teclas: S/Y = Todo · F = Sólo los que entran · N = No · Esc = Cancelar"
+  ,"suspected_permanent": "Posible permanente"
 }
