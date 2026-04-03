@@ -3,7 +3,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.css.query import NoMatches
 from textual.screen import ModalScreen
-from textual.widgets import Button, Footer, Header, ListItem, ListView, Static
+from textual.widgets import Button, Header, ListItem, ListView, Static
 from textual.worker import Worker
 import asyncio
 import json
@@ -196,13 +196,23 @@ class DiskScoutApp(App):
     """Main TUI app for Disk Scout."""
 
     BINDINGS = [
-        Binding("q", "quit", "Salir"),
-        Binding("backspace", "go_back", "Volver"),
-        Binding("space", "toggle_selection", "Marcar"),
-        Binding("a", "show_actions", "Acciones"),
+        Binding("q", "quit", "Salir", key_display="Q"),
+        Binding("enter", "open_selected", "Abrir", key_display="Enter", priority=True),
+        Binding("backspace", "go_back", "Volver", key_display="Backspace", priority=True),
+        Binding("space", "toggle_selection", "Marcar", key_display="Space"),
+        Binding("a", "show_actions", "Acciones", key_display="A"),
     ]
 
     CSS = """
+    #shortcuts_bar {
+        color: $text;
+        dock: bottom;
+        height: 1;
+        padding: 0 1;
+        background: $accent;
+        text-style: bold;
+    }
+
     #confirm_container {
         align: center middle;
         width: 60%;
@@ -228,7 +238,13 @@ class DiskScoutApp(App):
     }
     """
 
-    def __init__(self, root_path: str, lang: str = "es-AR"):
+    def __init__(
+        self,
+        root_path: str,
+        lang: str = "es-AR",
+        ignore_paths: Optional[list[str]] = None,
+        use_default_ignores: bool = True,
+    ):
         super().__init__()
         self.root_path = Path(root_path).resolve()
         self.current_path = self.root_path
@@ -242,16 +258,26 @@ class DiskScoutApp(App):
         self.current_total_size: int = 0
         self.current_max_size: int = 0
         self.deletion_task: Optional[asyncio.Task] = None
+        self.confirmation_task: Optional[asyncio.Task] = None
         self.last_deleted: list[Path] = []
         self.awaiting_overflow_confirmation: bool = False
+        self.preparing_delete_confirmation: bool = False
+        self.ignore_paths = ignore_paths or []
+        self.use_default_ignores = use_default_ignores
 
-        logger.info("DiskScoutApp initialized root=%s lang=%s", self.root_path, self.lang)
+        logger.info(
+            "DiskScoutApp initialized root=%s lang=%s default_ignores=%s ignore_paths=%s",
+            self.root_path,
+            self.lang,
+            self.use_default_ignores,
+            self.ignore_paths,
+        )
 
     def compose(self) -> ComposeResult:
         yield Header()
         yield Static(f"{self.strings['root']}: {self.current_path}", id="current_path_header")
         yield ListView(id="file_list")
-        yield Footer()
+        yield Static(self.strings.get("shortcuts", "Atajos: Enter abrir · Backspace volver · Espacio marcar · A acciones · Q salir"), id="shortcuts_bar")
 
     def on_mount(self):
         """Scan the initial directory when the app starts."""
@@ -259,7 +285,7 @@ class DiskScoutApp(App):
 
     def scan_directory(self, path: Path) -> None:
         """Launch an asynchronous scan for the given path."""
-        if self.scan_worker and not self.scan_worker.finished:
+        if self.scan_worker and not self.scan_worker.is_finished:
             self.scan_worker.cancel()
         self.selected_indices.clear()
         self.query_one("#file_list", ListView).clear()
@@ -273,7 +299,7 @@ class DiskScoutApp(App):
 
     def _scan_worker(self, path: Path) -> None:
         try:
-            items, total_size = self._collect_items(path)
+            items, total_size, error_count = self._collect_items(path)
         except PermissionError:
             self.call_from_thread(
                 self._update_header,
@@ -281,28 +307,29 @@ class DiskScoutApp(App):
             )
             return
 
-        self.call_from_thread(self._apply_scan_results, path, items, total_size)
+        self.call_from_thread(self._apply_scan_results, path, items, total_size, error_count)
 
-    def _collect_items(self, path: Path) -> tuple[list[dict], int]:
-        scanner = DiskScanner()
+    def _collect_items(self, path: Path) -> tuple[list[dict], int, int]:
+        scanner = DiskScanner(
+            ignore_paths=self.ignore_paths,
+            use_default_ignores=self.use_default_ignores,
+        )
+        results = scanner.scan(path, top_n=0)
         items: list[dict] = []
-        total_size = 0
-        with os.scandir(path) as entries:
-            for entry in entries:
-                try:
-                    is_dir = entry.is_dir()
-                    if is_dir:
-                        dir_results = scanner.scan(entry.path)
-                        size = dir_results['total_size']
-                    else:
-                        size = entry.stat().st_size
-                    items.append({"path": Path(entry.path), "size": size, "is_dir": is_dir})
-                    total_size += size
-                except (PermissionError, FileNotFoundError):
-                    continue
-        return items, total_size
+        for child in results.get("immediate_children", {}).values():
+            try:
+                items.append(
+                    {
+                        "path": Path(child["path"]),
+                        "size": int(child["size"]),
+                        "is_dir": bool(child["is_dir"]),
+                    }
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+        return items, int(results["total_size"]), len(results.get("errors", []))
 
-    def _apply_scan_results(self, path: Path, items: list[dict], total_size: int) -> None:
+    def _apply_scan_results(self, path: Path, items: list[dict], total_size: int, error_count: int = 0) -> None:
         if path != self.current_path:
             return
         self.current_items = sorted(items, key=lambda x: x['size'], reverse=True)
@@ -314,6 +341,8 @@ class DiskScoutApp(App):
             if self.current_items
             else f"{self.strings['empty_folder']} ({path})"
         )
+        if error_count:
+            message = f"{message} · {self.strings.get('partial_permissions_warning', 'Algunas rutas se omitieron por permisos.')}"
         self._update_header(message)
         self.last_deleted = []
 
@@ -347,22 +376,28 @@ class DiskScoutApp(App):
             logger.warning("Recycle bin query failed: %s", error)
             return None
 
+    def _group_paths_by_drive(self, paths: list[Path]) -> dict[str, list[Path]]:
+        grouped: dict[str, list[Path]] = {}
+        for path in paths:
+            drive = path.drive or os.path.splitdrive(str(path))[0]
+            drive_key = drive.upper()
+            grouped.setdefault(drive_key, []).append(path)
+        return grouped
+
     def _query_recycle_bin_multi(self, paths: list[Path]) -> Optional[Tuple[int, int]]:
         """Return aggregated (item_count, total_size) across all drives involved in paths."""
+        if os.name != "nt" or SHQUERYRBINFO is None or ctypes is None:
+            return None
         if not paths:
             return self._query_recycle_bin()
-        drives = []
-        for p in paths:
-            drive = p.drive or os.path.splitdrive(str(p))[0]
-            if drive and drive not in drives:
-                drives.append(drive)
         total_items = 0
         total_size = 0
-        for d in drives:
+        for drive_paths in self._group_paths_by_drive(paths).values():
             try:
                 info = SHQUERYRBINFO()
                 info.cbSize = ctypes.sizeof(SHQUERYRBINFO)
-                query_path = f"{d.rstrip(':')}:\\"
+                drive = drive_paths[0].drive or os.path.splitdrive(str(drive_paths[0]))[0]
+                query_path = f"{drive.rstrip(':')}:\\"
                 result = ctypes.windll.shell32.SHQueryRecycleBinW(
                     query_path,
                     ctypes.byref(info),
@@ -395,7 +430,7 @@ class DiskScoutApp(App):
         return None
 
     def _get_volume_guid_for_path(self, path: Path) -> Optional[str]:
-        """Return the volume GUID path for the drive of 'path', e.g. \\?\Volume{GUID}\\.
+        r"""Return the volume GUID path for the drive of 'path', e.g. \\?\Volume{GUID}\\.
 
         Uses GetVolumeNameForVolumeMountPointW on the drive root (C:\\).
         """
@@ -644,22 +679,22 @@ class DiskScoutApp(App):
     ) -> Optional[str]:
         if os.name != "nt" or not paths:
             return None
-        bin_stats = self._query_recycle_bin(paths[0])
-        if bin_stats is None:
-            return self.strings.get("recycle_bin_overflow_prompt_unknown")
-        _, current_usage = bin_stats
-        limit_bytes = self._get_recycle_bin_limit_bytes(paths[0], current_usage)
-        if limit_bytes is None:
-            return self.strings.get("recycle_bin_overflow_prompt_unknown")
-        if limit_bytes <= 0:
-            return self.strings.get("recycle_bin_overflow_prompt_unknown")
-        available = max(limit_bytes - current_usage, 0)
-        if total_size > available:
+        available_total = 0
+        for drive_paths in self._group_paths_by_drive(paths).values():
+            bin_stats = self._query_recycle_bin(drive_paths[0])
+            if bin_stats is None:
+                return self.strings.get("recycle_bin_overflow_prompt_unknown")
+            _, current_usage = bin_stats
+            limit_bytes = self._get_recycle_bin_limit_bytes(drive_paths[0], current_usage)
+            if limit_bytes is None:
+                return self.strings.get("recycle_bin_overflow_prompt_unknown")
+            available_total += max(limit_bytes - current_usage, 0)
+        if total_size > available_total:
             return self.strings.get(
                 "recycle_bin_overflow_prompt",
                 "Warning: the Recycle Bin may not have enough space.",
             ).format(
-                available=format_size(available),
+                available=format_size(available_total),
                 size=format_size(total_size),
             )
         return None
@@ -667,29 +702,10 @@ class DiskScoutApp(App):
     def _predict_recycle_bin_fit(
         self,
         paths: list[Path],
-    ) -> Optional[Tuple[list[Path], list[Path], int]]:
-        """Predict which of the given paths would fit in the Recycle Bin quota.
-
-        Returns (will_fit, overflow, available_bytes) or None if unknown.
-        """
+    ) -> Optional[dict[str, object]]:
+        """Predict which paths would fit in the Recycle Bin quota across all drives."""
         if os.name != "nt" or not paths:
             return None
-        bin_stats = self._query_recycle_bin(paths[0])
-        if bin_stats is None:
-            return None
-        _, current_usage = bin_stats
-        limit_bytes = self._get_recycle_bin_limit_bytes(paths[0], current_usage)
-        if limit_bytes is None or limit_bytes <= 0:
-            return None
-        available = max(limit_bytes - current_usage, 0)
-        logger.info(
-            "Recycle bin fit prediction: current_usage=%s limit=%s available=%s for %s items",
-            current_usage,
-            limit_bytes,
-            available,
-            len(paths),
-        )
-
         # Build a size map from current listing, fallback to stat/scan
         size_map: dict[Path, int] = {}
         for item in self.current_items:
@@ -701,23 +717,58 @@ class DiskScoutApp(App):
                 return size_map[rp]
             try:
                 if rp.is_dir():
-                    return int(DiskScanner().scan(str(rp))['total_size'])
+                    return int(
+                        DiskScanner(
+                            ignore_paths=self.ignore_paths,
+                            use_default_ignores=self.use_default_ignores,
+                        ).scan(str(rp), top_n=0)['total_size']
+                    )
                 return int(rp.stat().st_size)
             except Exception:
                 return 0
 
-        ordered = sorted(paths, key=lambda p: get_size(p))  # small first to maximize fit
         will_fit: list[Path] = []
         overflow: list[Path] = []
-        remaining = available
-        for p in ordered:
-            sz = get_size(p)
-            if sz <= remaining:
-                will_fit.append(p)
-                remaining -= sz
-            else:
-                overflow.append(p)
-        return (will_fit, overflow, available)
+        available_total = 0
+        min_margin: Optional[int] = None
+
+        for drive_paths in self._group_paths_by_drive(paths).values():
+            bin_stats = self._query_recycle_bin(drive_paths[0])
+            if bin_stats is None:
+                return None
+            _, current_usage = bin_stats
+            limit_bytes = self._get_recycle_bin_limit_bytes(drive_paths[0], current_usage)
+            if limit_bytes is None:
+                return None
+            available = max(limit_bytes - current_usage, 0)
+            available_total += available
+            logger.info(
+                "Recycle bin fit prediction: drive=%s current_usage=%s limit=%s available=%s items=%s",
+                drive_paths[0].drive,
+                current_usage,
+                limit_bytes,
+                available,
+                len(drive_paths),
+            )
+
+            remaining = available
+            for path in sorted(drive_paths, key=get_size):
+                size = get_size(path)
+                if size <= remaining:
+                    will_fit.append(path)
+                    remaining -= size
+                else:
+                    overflow.append(path)
+
+            if min_margin is None or remaining < min_margin:
+                min_margin = remaining
+
+        return {
+            "will_fit": will_fit,
+            "overflow": overflow,
+            "available_total": available_total,
+            "min_margin": 0 if min_margin is None else min_margin,
+        }
 
     def _get_path_size_cached(self, p: Path) -> int:
         """Return size for a path using current_items cache, falling back to stat/scan."""
@@ -727,13 +778,20 @@ class DiskScoutApp(App):
                 return int(item['size'])
         try:
             if rp.is_dir():
-                return int(DiskScanner().scan(str(rp))['total_size'])
+                return int(
+                    DiskScanner(
+                        ignore_paths=self.ignore_paths,
+                        use_default_ignores=self.use_default_ignores,
+                    ).scan(str(rp), top_n=0)['total_size']
+                )
             return int(rp.stat().st_size)
         except Exception:
             return 0
 
     def _start_deletion(self, items_to_delete: list[Path], total_size: int) -> None:
         self.deleting = True
+        self.preparing_delete_confirmation = False
+        self.confirmation_task = None
         self._update_header(
             self.strings.get(
                 "sending_to_trash",
@@ -779,15 +837,46 @@ class DiskScoutApp(App):
             )
             list_view.append(list_item)
 
+    def _get_highlighted_index(self) -> Optional[int]:
+        list_view = self.query_one("#file_list", ListView)
+        idx = list_view.index
+        if idx is None or idx < 0 or idx >= len(self.current_items):
+            return None
+        return idx
+
+    def _open_directory_at_index(self, idx: Optional[int]) -> bool:
+        if idx is None:
+            message = self.strings.get(
+                "select_folder_first",
+                "Selecciona una carpeta para entrar.",
+            )
+            self._update_header(message)
+            self.notify(message, severity="warning", timeout=4)
+            return False
+
+        item = self.current_items[idx]
+        if not item['is_dir']:
+            message = self.strings.get(
+                "selected_item_not_folder",
+                "El elemento seleccionado no es una carpeta.",
+            )
+            self._update_header(message)
+            self.notify(message, severity="warning", timeout=4)
+            return False
+
+        self.selected_indices.clear()
+        self.path_history.append(self.current_path)
+        self.current_path = item['path']
+        self.scan_directory(self.current_path)
+        return True
 
     def on_list_view_selected(self, event: ListView.Selected):
         """Handle item selection in the list."""
-        item = event.item
-        idx = event.list_view.index
-        if item.is_dir:
-            self.path_history.append(self.current_path)
-            self.current_path = item.item_path
-            self.scan_directory(self.current_path)
+        self._open_directory_at_index(event.list_view.index)
+
+    def action_open_selected(self) -> None:
+        """Open the highlighted directory using Enter."""
+        self._open_directory_at_index(self._get_highlighted_index())
 
     def action_toggle_selection(self):
         """Toggle selection of the highlighted item."""
@@ -811,6 +900,21 @@ class DiskScoutApp(App):
         )
         if not self.selected_indices:
             logger.info("No items selected; action aborted")
+            message = self.strings.get(
+                "select_items_first",
+                "Selecciona uno o más elementos con Espacio antes de usar Acciones.",
+            )
+            self._update_header(message)
+            self.notify(message, severity="warning", timeout=4)
+            return
+        if self.preparing_delete_confirmation:
+            logger.warning("Delete confirmation preparation already in progress")
+            self._update_header(
+                self.strings.get(
+                    "preparing_delete_confirmation",
+                    "Preparando confirmación de borrado...",
+                )
+            )
             return
         if self.deleting or self.awaiting_overflow_confirmation:
             logger.warning("Deletion already in progress")
@@ -836,66 +940,72 @@ class DiskScoutApp(App):
             len(items_to_delete),
             format_size(total_size),
         )
-        # Build an informed confirmation message BEFORE asking the user
-        # so the user sees mixed/overflow/marginal risks up front.
-        confirm_message: str
+        self.preparing_delete_confirmation = True
+        self._update_header(
+            self.strings.get(
+                "preparing_delete_confirmation",
+                "Preparando confirmación de borrado...",
+            )
+        )
+        if self.confirmation_task and not self.confirmation_task.done():
+            self.confirmation_task.cancel()
+        self.confirmation_task = asyncio.create_task(
+            self._prepare_delete_confirmation(items_to_delete, total_size)
+        )
+
+    def _build_delete_confirmation_plan(
+        self,
+        items_to_delete: list[Path],
+        total_size: int,
+    ) -> dict[str, object]:
+        """Build the confirmation plan outside the UI thread."""
+        default_message = (
+            f"{self.strings['confirm_delete']}\n"
+            f"{len(items_to_delete)} · {format_size(total_size)}"
+        )
+
         prediction = self._predict_recycle_bin_fit(items_to_delete)
         if prediction is not None:
-            will_fit, overflow, available = prediction
+            will_fit = list(prediction["will_fit"])
+            overflow = list(prediction["overflow"])
+            available = int(prediction["available_total"])
+            min_margin = int(prediction["min_margin"])
             if will_fit and overflow:
                 preview_names = ", ".join(p.name for p in overflow[:3])
                 if len(overflow) > 3:
                     preview_names += f" +{len(overflow) - 3}"
-                # Compute total sizes for each group for display
                 fit_size_total = sum(self._get_path_size_cached(p) for p in will_fit)
                 overflow_size_total = sum(self._get_path_size_cached(p) for p in overflow)
-                confirm_message = self.strings.get(
-                    "recycle_bin_mixed_prompt",
-                    "Heads up: {fit} of {total} items would fit; {overflow} may be deleted.",
-                ).format(
-                    fit=len(will_fit),
-                    total=len(items_to_delete),
-                    overflow=len(overflow),
-                    preview=preview_names,
-                    fit_size=format_size(fit_size_total),
-                    overflow_size=format_size(overflow_size_total),
-                )
-                # Push the mixed modal with three options and return early.
-                def handle_mixed(choice: Optional[str]) -> None:
-                    logger.info("Mixed choice result=%s", choice)
-                    if choice == "fit":
-                        paths_fit = will_fit
-                        size_fit = sum(self._get_path_size_cached(p) for p in paths_fit)
-                        if not paths_fit:
-                            self._update_header(self.strings.get("delete_cancelled", "Acción cancelada"))
-                            return
-                        self._start_deletion(paths_fit, size_fit)
-                        return
-                    elif choice == "all":
-                        self._start_deletion(items_to_delete, total_size)
-                        return
-                    else:
-                        self._update_header(self.strings.get("delete_cancelled", "Acción cancelada"))
-                        return
-
-                self.push_screen(
-                    MixedDeletionModal(confirm_message, self.strings),
-                    handle_mixed,
-                )
-                return
-            elif overflow and not will_fit:
-                # None would fit: treat as overflow warn
-                confirm_message = self.strings.get(
-                    "recycle_bin_overflow_prompt",
-                    "Warning: the Recycle Bin may not have enough space.",
-                ).format(
-                    available=format_size(max(available, 0)),
-                    size=format_size(total_size),
-                )
-            elif will_fit and not overflow:
-                # All fit, but maybe with a very small margin
-                margin = max(available - total_size, 0)
-                margin_threshold = 64 * 1024 * 1024  # 64 MiB safety margin
+                return {
+                    "modal": "mixed",
+                    "message": self.strings.get(
+                        "recycle_bin_mixed_prompt",
+                        "Heads up: {fit} of {total} items would fit; {overflow} may be deleted.",
+                    ).format(
+                        fit=len(will_fit),
+                        total=len(items_to_delete),
+                        overflow=len(overflow),
+                        preview=preview_names,
+                        fit_size=format_size(fit_size_total),
+                        overflow_size=format_size(overflow_size_total),
+                    ),
+                    "will_fit": will_fit,
+                    "overflow": overflow,
+                }
+            if overflow and not will_fit:
+                return {
+                    "modal": "confirm",
+                    "message": self.strings.get(
+                        "recycle_bin_overflow_prompt",
+                        "Warning: the Recycle Bin may not have enough space.",
+                    ).format(
+                        available=format_size(max(available, 0)),
+                        size=format_size(total_size),
+                    ),
+                }
+            if will_fit and not overflow:
+                margin = max(min_margin, 0)
+                margin_threshold = 64 * 1024 * 1024
                 logger.info(
                     "Recycle bin margin check (pre-confirm): available=%s total_size=%s margin=%s threshold=%s",
                     available,
@@ -904,30 +1014,71 @@ class DiskScoutApp(App):
                     margin_threshold,
                 )
                 if margin <= margin_threshold:
-                    confirm_message = self.strings.get(
-                        "recycle_bin_marginal_prompt",
-                        "Heads up: the Recycle Bin would have very little free space left ({margin}). Continue?",
-                    ).format(margin=format_size(margin))
-                else:
-                    confirm_message = (
-                        f"{self.strings['confirm_delete']}\n"
-                        f"{len(items_to_delete)} · {format_size(total_size)}"
-                    )
-            else:
-                confirm_message = (
+                    return {
+                        "modal": "confirm",
+                        "message": self.strings.get(
+                            "recycle_bin_marginal_prompt",
+                            "Heads up: the Recycle Bin would have very little free space left ({margin}). Continue?",
+                        ).format(margin=format_size(margin)),
+                    }
+            return {"modal": "confirm", "message": default_message}
+
+        overflow_warning = self._evaluate_recycle_bin_risk(items_to_delete, total_size)
+        if overflow_warning:
+            return {"modal": "confirm", "message": overflow_warning}
+        return {"modal": "confirm", "message": default_message}
+
+    async def _prepare_delete_confirmation(
+        self,
+        items_to_delete: list[Path],
+        total_size: int,
+    ) -> None:
+        try:
+            plan = await asyncio.to_thread(
+                self._build_delete_confirmation_plan,
+                items_to_delete,
+                total_size,
+            )
+        except asyncio.CancelledError:
+            self.preparing_delete_confirmation = False
+            self.confirmation_task = None
+            raise
+        except Exception:
+            logger.exception("Error preparing delete confirmation")
+            plan = {
+                "modal": "confirm",
+                "message": (
                     f"{self.strings['confirm_delete']}\n"
                     f"{len(items_to_delete)} · {format_size(total_size)}"
-                )
-        else:
-            # Fallback to coarse check (unknown space or API not available)
-            overflow_warning = self._evaluate_recycle_bin_risk(items_to_delete, total_size)
-            if overflow_warning:
-                confirm_message = overflow_warning
-            else:
-                confirm_message = (
-                    f"{self.strings['confirm_delete']}\n"
-                    f"{len(items_to_delete)} · {format_size(total_size)}"
-                )
+                ),
+            }
+
+        self.preparing_delete_confirmation = False
+        self.confirmation_task = None
+
+        if plan.get("modal") == "mixed":
+            will_fit = list(plan.get("will_fit", []))
+
+            def handle_mixed(choice: Optional[str]) -> None:
+                logger.info("Mixed choice result=%s", choice)
+                if choice == "fit":
+                    paths_fit = will_fit
+                    size_fit = sum(self._get_path_size_cached(p) for p in paths_fit)
+                    if not paths_fit:
+                        self._update_header(self.strings.get("delete_cancelled", "Acción cancelada"))
+                        return
+                    self._start_deletion(paths_fit, size_fit)
+                    return
+                if choice == "all":
+                    self._start_deletion(items_to_delete, total_size)
+                    return
+                self._update_header(self.strings.get("delete_cancelled", "Acción cancelada"))
+
+            self.push_screen(
+                MixedDeletionModal(str(plan["message"]), self.strings),
+                handle_mixed,
+            )
+            return
 
         def handle_confirmation(confirmed: Optional[bool]) -> None:
             logger.info("Deletion confirmation result=%s", confirmed)
@@ -938,10 +1089,10 @@ class DiskScoutApp(App):
                 )
                 return
             self._start_deletion(items_to_delete, total_size)
-        
+
         self.push_screen(
-            ConfirmDeletionModal(confirm_message, self.strings),
-            handle_confirmation
+            ConfirmDeletionModal(str(plan["message"]), self.strings),
+            handle_confirmation,
         )
     
     async def _perform_deletion(self, paths: list[Path], expected_total_size: int) -> None:
@@ -982,7 +1133,9 @@ class DiskScoutApp(App):
     ) -> None:
         self.deleting = False
         self.deletion_task = None
+        self.confirmation_task = None
         self.awaiting_overflow_confirmation = False
+        self.preparing_delete_confirmation = False
         processed = len(successes)
         logger.info(
             "Deletion worker finished: processed=%s failures=%s",
@@ -1021,7 +1174,6 @@ class DiskScoutApp(App):
             logger.warning("Deletion failures encountered: %s", failures)
             message = f"{message} · {detail_template.format(path=str(failed_path), error=error_message)}"
 
-        self._update_header(message)
         potential_bin_issue = False
         suspected_count = 0
         if (
@@ -1065,6 +1217,8 @@ class DiskScoutApp(App):
                     "Warning: Windows may have deleted items permanently.",
                 )
             message = f"{message} · {warning_short}"
+
+        self._update_header(message)
 
         if processed:
             # If we suspect some items were permanently deleted, try to infer which ones
@@ -1135,6 +1289,13 @@ class DiskScoutApp(App):
         if self.path_history:
             self.current_path = self.path_history.pop()
             self.scan_directory(self.current_path)
+            return
+        message = self.strings.get(
+            "already_at_root",
+            "Ya estás en la carpeta inicial.",
+        )
+        self._update_header(message)
+        self.notify(message, severity="information", timeout=4)
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
