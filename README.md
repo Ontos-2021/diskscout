@@ -30,7 +30,7 @@ Si sólo querés instalar dependencias de ejecución sin herramientas de desarro
 
 Dependencias actuales:
 
-- `textual==0.40.0`
+- `textual==8.2.8`
 - `send2trash>=1.8.0`
 
 Dependencias de desarrollo:

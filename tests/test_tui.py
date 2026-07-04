@@ -2,6 +2,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import tui.app as app_module
+import tui.recycle_bin as recycle_bin_module
 
 
 def test_collect_items_uses_a_single_scan_result(monkeypatch, tmp_path):
@@ -317,6 +318,49 @@ def test_action_go_back_without_history_shows_feedback(monkeypatch, tmp_path):
     assert notifications[-1] == (app.strings["already_at_root"], "information", 4)
 
 
+def test_action_go_back_shows_cached_parent_items_immediately(monkeypatch, tmp_path):
+    app = app_module.DiskScoutApp(str(tmp_path))
+    child = tmp_path / "child"
+    parent_item = {"path": tmp_path / "root-file.txt", "size": 7, "is_dir": False}
+    app.current_path = child
+    app.path_history = [tmp_path]
+    app.current_items = [{"path": child / "child-file.txt", "size": 3, "is_dir": False}]
+    app.scan_cache[tmp_path] = ([parent_item], 7, 0)
+
+    class FakeListView:
+        index = 0
+
+        def __init__(self):
+            self.items = []
+            self.clear_count = 0
+
+        def clear(self):
+            self.clear_count += 1
+            self.items.clear()
+
+        def append(self, item):
+            self.items.append(item)
+
+    fake_list = FakeListView()
+    headers = []
+    workers = []
+    monkeypatch.setattr(app, "query_one", lambda selector, cls=None: fake_list)
+    monkeypatch.setattr(app, "_update_header", lambda message: headers.append(message))
+    monkeypatch.setattr(
+        app,
+        "run_worker",
+        lambda *args, **kwargs: workers.append((args, kwargs)) or "new-worker",
+    )
+
+    app.action_go_back()
+
+    assert app.current_path == tmp_path
+    assert app.current_items == [parent_item]
+    assert len(fake_list.items) == 1
+    assert headers[-1].endswith(f"{app.strings['scanning']}...")
+    assert len(workers) == 1
+
+
 def test_query_recycle_bin_multi_aggregates_per_drive(monkeypatch, tmp_path):
     class FakeInfo:
         def __init__(self):
@@ -343,9 +387,9 @@ def test_query_recycle_bin_multi_aggregates_per_drive(monkeypatch, tmp_path):
         ),
     )
 
-    monkeypatch.setattr(app_module.os, "name", "nt", raising=False)
-    monkeypatch.setattr(app_module, "ctypes", fake_ctypes)
-    monkeypatch.setattr(app_module, "SHQUERYRBINFO", FakeInfo)
+    monkeypatch.setattr(recycle_bin_module.os, "name", "nt", raising=False)
+    monkeypatch.setattr(recycle_bin_module, "ctypes", fake_ctypes)
+    monkeypatch.setattr(recycle_bin_module, "SHQUERYRBINFO", FakeInfo)
 
     app = app_module.DiskScoutApp(str(tmp_path))
     result = app._query_recycle_bin_multi([
@@ -379,9 +423,9 @@ def test_query_recycle_bin_multi_returns_none_when_any_drive_fails(monkeypatch, 
         ),
     )
 
-    monkeypatch.setattr(app_module.os, "name", "nt", raising=False)
-    monkeypatch.setattr(app_module, "ctypes", fake_ctypes)
-    monkeypatch.setattr(app_module, "SHQUERYRBINFO", FakeInfo)
+    monkeypatch.setattr(recycle_bin_module.os, "name", "nt", raising=False)
+    monkeypatch.setattr(recycle_bin_module, "ctypes", fake_ctypes)
+    monkeypatch.setattr(recycle_bin_module, "SHQUERYRBINFO", FakeInfo)
 
     app = app_module.DiskScoutApp(str(tmp_path))
 
@@ -442,8 +486,8 @@ def test_get_recycle_bin_limit_reads_nested_bins_registry(monkeypatch, tmp_path)
                 raise FileNotFoundError(value_name)
             return values[value_name], None
 
-    monkeypatch.setattr(app_module.os, "name", "nt", raising=False)
-    monkeypatch.setattr(app_module, "winreg", FakeWinReg())
+    monkeypatch.setattr(recycle_bin_module.os, "name", "nt", raising=False)
+    monkeypatch.setattr(recycle_bin_module, "winreg", FakeWinReg())
 
     app = app_module.DiskScoutApp(str(tmp_path))
     monkeypatch.setattr(app, "_get_volume_guid_for_path", lambda path: "\\\\?\\volume{abc}")
@@ -503,8 +547,8 @@ def test_get_recycle_bin_limit_respects_nuke_on_delete(monkeypatch, tmp_path):
                 raise FileNotFoundError(value_name)
             return values[value_name], None
 
-    monkeypatch.setattr(app_module.os, "name", "nt", raising=False)
-    monkeypatch.setattr(app_module, "winreg", FakeWinReg())
+    monkeypatch.setattr(recycle_bin_module.os, "name", "nt", raising=False)
+    monkeypatch.setattr(recycle_bin_module, "winreg", FakeWinReg())
 
     app = app_module.DiskScoutApp(str(tmp_path))
     monkeypatch.setattr(app, "_get_volume_guid_for_path", lambda path: "\\\\?\\volume{abc}")
@@ -561,8 +605,8 @@ def test_get_recycle_bin_limit_uses_percent_fallback(monkeypatch, tmp_path):
                 raise FileNotFoundError(value_name)
             return values[value_name], None
 
-    monkeypatch.setattr(app_module.os, "name", "nt", raising=False)
-    monkeypatch.setattr(app_module, "winreg", FakeWinReg())
+    monkeypatch.setattr(recycle_bin_module.os, "name", "nt", raising=False)
+    monkeypatch.setattr(recycle_bin_module, "winreg", FakeWinReg())
 
     app = app_module.DiskScoutApp(str(tmp_path))
     monkeypatch.setattr(app, "_get_volume_guid_for_path", lambda path: "\\\\?\\volume{abc}")
@@ -572,7 +616,7 @@ def test_get_recycle_bin_limit_uses_percent_fallback(monkeypatch, tmp_path):
 
 
 def test_predict_recycle_bin_fit_handles_multiple_drives(monkeypatch, tmp_path):
-    monkeypatch.setattr(app_module.os, "name", "nt", raising=False)
+    monkeypatch.setattr(recycle_bin_module.os, "name", "nt", raising=False)
     app = app_module.DiskScoutApp(str(tmp_path))
     app.current_items = [
         {"path": Path("C:/tmp/big.txt"), "size": 8, "is_dir": False},
