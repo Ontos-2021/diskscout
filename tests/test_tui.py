@@ -73,6 +73,40 @@ def test_collect_items_returns_partial_error_count(monkeypatch, tmp_path):
     assert items[0]["path"].name == "folder"
 
 
+def test_collect_items_passes_scan_filters_to_scanner(monkeypatch, tmp_path):
+    init_kwargs = []
+
+    class FakeScanner:
+        def __init__(self, **kwargs):
+            init_kwargs.append(kwargs)
+
+        def scan(self, path, progress_callback=None, top_n=20):
+            return {"total_size": 0, "immediate_children": {}, "errors": []}
+
+    monkeypatch.setattr(app_module, "DiskScanner", FakeScanner)
+
+    app = app_module.DiskScoutApp(
+        str(tmp_path),
+        include_ext=["log"],
+        exclude_ext=["tmp"],
+        ignore_paths=["build"],
+        max_depth=2,
+        follow_symlinks=True,
+        use_default_ignores=False,
+    )
+
+    app._collect_items(tmp_path)
+
+    assert init_kwargs == [{
+        "include_ext": ["log"],
+        "exclude_ext": ["tmp"],
+        "ignore_paths": ["build"],
+        "max_depth": 2,
+        "follow_symlinks": True,
+        "use_default_ignores": False,
+    }]
+
+
 def test_apply_scan_results_shows_partial_permissions_warning(monkeypatch, tmp_path):
     app = app_module.DiskScoutApp(str(tmp_path))
 
@@ -321,6 +355,40 @@ def test_query_recycle_bin_multi_aggregates_per_drive(monkeypatch, tmp_path):
     ])
 
     assert result == (5, 350)
+
+
+def test_query_recycle_bin_multi_returns_none_when_any_drive_fails(monkeypatch, tmp_path):
+    class FakeInfo:
+        def __init__(self):
+            self.cbSize = 0
+            self.i64NumItems = 0
+            self.i64Size = 0
+
+    def fake_query_recycle_bin(query_path, info):
+        if query_path == "D:\\":
+            return 1
+        info.i64NumItems = 2
+        info.i64Size = 100
+        return 0
+
+    fake_ctypes = SimpleNamespace(
+        sizeof=lambda _: 1,
+        byref=lambda value: value,
+        windll=SimpleNamespace(
+            shell32=SimpleNamespace(SHQueryRecycleBinW=fake_query_recycle_bin)
+        ),
+    )
+
+    monkeypatch.setattr(app_module.os, "name", "nt", raising=False)
+    monkeypatch.setattr(app_module, "ctypes", fake_ctypes)
+    monkeypatch.setattr(app_module, "SHQUERYRBINFO", FakeInfo)
+
+    app = app_module.DiskScoutApp(str(tmp_path))
+
+    assert app._query_recycle_bin_multi([
+        Path("C:/tmp/a.txt"),
+        Path("D:/tmp/b.txt"),
+    ]) is None
 
 
 def test_get_recycle_bin_limit_reads_nested_bins_registry(monkeypatch, tmp_path):

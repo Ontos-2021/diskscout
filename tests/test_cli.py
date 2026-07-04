@@ -115,3 +115,67 @@ def test_scan_uses_persisted_config_and_cli_overrides(tmp_path, monkeypatch, cap
     assert result["file_count"] == 1
     assert "build" not in result["immediate_children"]
     assert "dist" not in result["immediate_children"]
+
+
+def test_config_show_falls_back_to_defaults_when_config_is_corrupt(tmp_path, monkeypatch, capsys):
+    appdata_dir = tmp_path / "AppData" / "Roaming"
+    monkeypatch.setenv("APPDATA", str(appdata_dir))
+    config_path = appdata_dir / "DiskScout" / "config.json"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text("{not-json", encoding="utf-8")
+
+    monkeypatch.setattr(sys, "argv", ["diskscout", "config", "show"])
+
+    main()
+
+    shown = json.loads(capsys.readouterr().out)
+    assert shown["ignore_paths"] == []
+    assert shown["use_default_ignores"] is True
+
+
+def test_scan_save_snapshot_includes_all_files(tmp_path, monkeypatch, capsys):
+    for index in range(25):
+        (tmp_path / f"file_{index}.txt").write_text("x", encoding="utf-8")
+    output_path = tmp_path / "snapshot.json"
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["diskscout", "scan", str(tmp_path), "--save", str(output_path)],
+    )
+
+    main()
+    capsys.readouterr()
+
+    snapshot = json.loads(output_path.read_text(encoding="utf-8"))
+    file_items = [item for item in snapshot["items"] if item["type"] == "file"]
+    assert len(file_items) == 25
+
+
+def test_scan_exposes_extension_and_depth_filters(tmp_path, monkeypatch, capsys):
+    (tmp_path / "keep.log").write_text("x", encoding="utf-8")
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (nested / "skip.log").write_text("x", encoding="utf-8")
+    (tmp_path / "skip.tmp").write_text("x", encoding="utf-8")
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "diskscout",
+            "scan",
+            str(tmp_path),
+            "--json",
+            "--include-ext",
+            "log",
+            "--max-depth",
+            "0",
+        ],
+    )
+
+    main()
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["file_count"] == 1
+    assert result["total_size"] == 1

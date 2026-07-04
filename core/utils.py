@@ -72,8 +72,11 @@ def load_app_config():
     config_path = get_config_path()
     if not config_path.exists():
         return dict(DEFAULT_APP_CONFIG)
-    with open(config_path, 'r', encoding='utf-8') as f:
-        loaded = json.load(f)
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            loaded = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return dict(DEFAULT_APP_CONFIG)
 
     config = dict(DEFAULT_APP_CONFIG)
     if isinstance(loaded, dict):

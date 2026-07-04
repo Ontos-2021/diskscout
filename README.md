@@ -1,6 +1,6 @@
 # DiskScout
 
-Analizador de disco en Python con interfaz de línea de comandos (CLI) y TUI basada en Textual para explorar, ordenar y limpiar carpetas grandes con seguridad (envío a Papelera).
+Analizador de disco en Python con interfaz de línea de comandos (CLI) y TUI basada en Textual para explorar, ordenar y limpiar carpetas grandes con seguridad. En Windows intenta enviar a la Papelera y muestra advertencias conservadoras si detecta que parte del contenido podría terminar borrándose de forma permanente.
 
 ## Características
 
@@ -9,12 +9,13 @@ Analizador de disco en Python con interfaz de línea de comandos (CLI) y TUI bas
 - Listado de archivos más pesados y resumen por extensiones
 - Exportación a JSON/CSV con todos los archivos analizados
 - Snapshots (guardado y comparación de tamaños totales)
-- Interfaz TUI con navegación por carpetas, selección múltiple y envío a Papelera
-- Internacionalización básica (español/inglés)
+- Interfaz TUI con escaneo en segundo plano, navegación por carpetas, selección múltiple y borrado seguro
+- Configuración persistente de filtros compartida entre CLI y TUI
+- Internacionalización básica (español/inglés), con `es-AR` como idioma por defecto
 
 ## Requisitos
 
-- Python 3.10+
+- Python 3.9+
 - Windows, macOS o Linux
 
 ## Instalación
@@ -22,10 +23,19 @@ Analizador de disco en Python con interfaz de línea de comandos (CLI) y TUI bas
 ```powershell
 python -m venv .venv
 .venv\\Scripts\\Activate.ps1
-pip install -r requirements.txt
+pip install -e .[dev]
 ```
 
-`send2trash` y `pytest` ya están incluidos en `requirements.txt`.
+Si sólo querés instalar dependencias de ejecución sin herramientas de desarrollo, usá `pip install -r requirements.txt`.
+
+Dependencias actuales:
+
+- `textual==0.40.0`
+- `send2trash>=1.8.0`
+
+Dependencias de desarrollo:
+
+- `pytest>=8.0.0`
 
 ## Uso rápido
 
@@ -39,6 +49,7 @@ python -m cli.main scan C:\\ruta\\a\\carpeta
 # Puedes sumar exclusiones propias o desactivar las predeterminadas
 python -m cli.main scan C:\\ruta\\a\\carpeta --ignore-path build --ignore-path dist
 python -m cli.main scan C:\\ruta\\a\\carpeta --no-default-ignores
+python -m cli.main scan C:\\ruta\\a\\carpeta --include-ext log --exclude-ext tmp --max-depth 2
 
 # Persistir filtros para futuros usos de CLI y TUI
 python -m cli.main config set --ignore-path build --ignore-path dist --use-default-ignores true
@@ -57,6 +68,8 @@ python -m cli.main scan C:\\ruta\\a\\carpeta --save snap2.json
 python -m cli.main diff snap1.json snap2.json
 ```
 
+Los snapshots guardan el total escaneado, los hijos inmediatos agregados y la lista completa de archivos incluidos por los filtros activos.
+
 TUI:
 
 ```powershell
@@ -69,16 +82,38 @@ python -m cli.main tui C:\\ruta\\a\\carpeta --lang en-US
 python -m cli.main tui C:\\ruta\\a\\carpeta --ignore-path build
 ```
 
-Atajos de teclado: ↑↓ mover · Enter entrar · Backspace volver · Espacio marcar · A acciones · Q salir
+También podés usar el entry point instalado:
+
+```powershell
+diskscout scan C:\\ruta\\a\\carpeta
+diskscout tui C:\\ruta\\a\\carpeta
+```
+
+Atajos de teclado: ↑↓ mover · Enter abrir carpeta seleccionada · Backspace volver a la carpeta anterior · Espacio marcar · A Papelera · Q salir
+
+Comportamiento actual de la TUI:
+
+- El escaneo de cada carpeta se ejecuta en segundo plano para no bloquear la interfaz.
+- La vista actual se construye con una sola pasada del escáner por carpeta.
+- Si algunas rutas fallan por permisos, la vista se muestra igual y el encabezado avisa que hubo omisiones parciales.
+- `A` abre el flujo de envío a Papelera sobre la selección actual. Si no hay nada marcado, la app lo indica explícitamente.
 
 ## Idioma
 
 Los textos se cargan desde `assets/strings`. Actualmente hay `es-AR.json` y `en-US.json`. La TUI usa español por defecto y se puede forzar otro idioma con `--lang`.
 
+## Borrado seguro
+
+- El borrado desde la TUI usa `send2trash`.
+- En Windows, DiskScout consulta el estado de la Papelera por unidad y estima si los elementos seleccionados caben dentro del cupo disponible.
+- Si detecta riesgo de desborde, configuración desconocida o un resultado mixto entre unidades, muestra una confirmación más explícita antes de continuar.
+- Después del borrado, si Windows parece haber omitido la Papelera para parte del contenido, la app muestra una advertencia adicional.
+
 ## Limitaciones conocidas
 
-- En árboles extremadamente grandes el escaneo puede seguir tardando, pero ahora la TUI hace una sola pasada por carpeta en lugar de reescanear cada hijo.
-- La detección de capacidad de la Papelera sigue dependiendo de APIs y claves de registro de Windows; si el sistema tiene una configuración no estándar, la app cae en advertencias conservadoras.
+- En árboles extremadamente grandes el escaneo puede seguir tardando, aunque la TUI hace una sola pasada por carpeta en lugar de reescanear cada hijo.
+- La detección de capacidad de la Papelera depende de APIs y claves de registro de Windows; si el sistema tiene una configuración no estándar, la app cae en advertencias conservadoras.
+- El CLI no elimina archivos; las acciones de borrado sólo están disponibles en la TUI.
 
 ## Filtros por defecto
 
@@ -109,6 +144,8 @@ Claves soportadas actualmente:
 
 Las banderas del CLI se aplican encima de la configuración persistida. Por ejemplo, puedes guardar `build` como exclusión fija y sumar `dist` sólo en una ejecución concreta con `--ignore-path dist`.
 
+La TUI usa esa misma configuración persistida al arrancar, salvo que pases overrides por línea de comandos.
+
 ## Desarrollo
 
 Estructura del proyecto:
@@ -126,6 +163,7 @@ tests/        # Tests de regresión
 Ejecutar la suite:
 
 ```powershell
+python -m pip install -e .[dev]
 python -m pytest
 ```
 
@@ -137,7 +175,9 @@ Cobertura actual de regresión:
 - cálculo recursivo de tamaños para hijos inmediatos y snapshots
 - exportación CSV válida y completa
 - construcción de la lista en TUI a partir de una sola pasada del escáner
-- flujo de Papelera en Windows con APIs/registro simulados, incluyendo `NukeOnDelete` y fallback por porcentaje
+- navegación con `Enter` y `Backspace`, selección y confirmaciones asíncronas en la TUI
+- tolerancia a errores parciales de permisos durante el escaneo
+- flujo de Papelera en Windows con APIs/registro simulados, incluyendo `NukeOnDelete`, fallback por porcentaje y escenarios multiunidad
 
 Sugerencias y PRs son bienvenidos.
 

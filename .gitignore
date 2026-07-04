@@ -1,4 +1,11 @@
 venv/
+.venv/
 __pycache__/
+*.py[cod]
+.Python
 tui.log
+test.csv
 .pytest_cache/
+build/
+dist/
+*.egg-info/

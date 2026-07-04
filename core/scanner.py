@@ -28,8 +28,8 @@ class DiskScanner:
         use_default_ignores=True,
     ):
         self.min_size = min_size
-        self.include_ext = set(include_ext) if include_ext else None
-        self.exclude_ext = set(exclude_ext) if exclude_ext else None
+        self.include_ext = self._normalize_extensions(include_ext)
+        self.exclude_ext = self._normalize_extensions(exclude_ext)
         configured_ignores = set(ignore_paths) if ignore_paths else set()
         if use_default_ignores:
             configured_ignores.update(DEFAULT_IGNORE_PATHS)
@@ -41,6 +41,20 @@ class DiskScanner:
         self.max_depth = max_depth
         self.follow_symlinks = follow_symlinks
         self.use_default_ignores = use_default_ignores
+
+    @staticmethod
+    def _normalize_extensions(extensions):
+        if not extensions:
+            return None
+        normalized = set()
+        for extension in extensions:
+            value = str(extension).strip().lower()
+            if not value:
+                continue
+            if not value.startswith('.'):
+                value = f'.{value}'
+            normalized.add(value)
+        return normalized or None
 
     def scan(self, root_path, progress_callback=None, top_n=20):
         root_path = Path(root_path).resolve()
@@ -92,7 +106,16 @@ class DiskScanner:
         def get_size(path_stat):
             return path_stat.st_size
 
-        for dirpath, dirnames, filenames in os.walk(root_path, topdown=True, followlinks=self.follow_symlinks):
+        def record_walk_error(error):
+            path = getattr(error, "filename", None) or root_path
+            errors.append(f"Error accessing {path}: {error}")
+
+        for dirpath, dirnames, filenames in os.walk(
+            root_path,
+            topdown=True,
+            onerror=record_walk_error,
+            followlinks=self.follow_symlinks,
+        ):
             current_dir = Path(dirpath)
             if current_dir != root_path and should_ignore(current_dir):
                 dirnames[:] = []

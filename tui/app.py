@@ -14,13 +14,18 @@ import logging
 from typing import Optional, Tuple
 
 logger = logging.getLogger("DiskScoutTUI")
-if not logger.handlers:
+
+
+def configure_logging() -> None:
+    """Configure TUI logging when the app starts, not when the module is imported."""
+    if logger.handlers:
+        return
     handler = logging.FileHandler("tui.log", encoding="utf-8")
     formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
     handler.setFormatter(formatter)
     logger.addHandler(handler)
-logger.setLevel(logging.INFO)
-logger.propagate = False
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
 
 if os.name == "nt":
     import ctypes
@@ -200,7 +205,7 @@ class DiskScoutApp(App):
         Binding("enter", "open_selected", "Abrir", key_display="Enter", priority=True),
         Binding("backspace", "go_back", "Volver", key_display="Backspace", priority=True),
         Binding("space", "toggle_selection", "Marcar", key_display="Space"),
-        Binding("a", "show_actions", "Acciones", key_display="A"),
+        Binding("a", "show_actions", "Papelera", key_display="A"),
     ]
 
     CSS = """
@@ -243,6 +248,10 @@ class DiskScoutApp(App):
         root_path: str,
         lang: str = "es-AR",
         ignore_paths: Optional[list[str]] = None,
+        include_ext: Optional[list[str]] = None,
+        exclude_ext: Optional[list[str]] = None,
+        max_depth: Optional[int] = None,
+        follow_symlinks: bool = False,
         use_default_ignores: bool = True,
     ):
         super().__init__()
@@ -263,7 +272,12 @@ class DiskScoutApp(App):
         self.awaiting_overflow_confirmation: bool = False
         self.preparing_delete_confirmation: bool = False
         self.ignore_paths = ignore_paths or []
+        self.include_ext = include_ext or []
+        self.exclude_ext = exclude_ext or []
+        self.max_depth = max_depth
+        self.follow_symlinks = follow_symlinks
         self.use_default_ignores = use_default_ignores
+        configure_logging()
 
         logger.info(
             "DiskScoutApp initialized root=%s lang=%s default_ignores=%s ignore_paths=%s",
@@ -277,7 +291,7 @@ class DiskScoutApp(App):
         yield Header()
         yield Static(f"{self.strings['root']}: {self.current_path}", id="current_path_header")
         yield ListView(id="file_list")
-        yield Static(self.strings.get("shortcuts", "Atajos: Enter abrir · Backspace volver · Espacio marcar · A acciones · Q salir"), id="shortcuts_bar")
+        yield Static(self.strings.get("shortcuts", "Atajos: Enter abrir · Backspace volver · Espacio marcar · A Papelera · Q salir"), id="shortcuts_bar")
 
     def on_mount(self):
         """Scan the initial directory when the app starts."""
@@ -311,7 +325,11 @@ class DiskScoutApp(App):
 
     def _collect_items(self, path: Path) -> tuple[list[dict], int, int]:
         scanner = DiskScanner(
+            include_ext=self.include_ext,
+            exclude_ext=self.exclude_ext,
             ignore_paths=self.ignore_paths,
+            max_depth=self.max_depth,
+            follow_symlinks=self.follow_symlinks,
             use_default_ignores=self.use_default_ignores,
         )
         results = scanner.scan(path, top_n=0)
@@ -402,11 +420,12 @@ class DiskScoutApp(App):
                     query_path,
                     ctypes.byref(info),
                 )
-                if result == 0:
-                    total_items += int(info.i64NumItems)
-                    total_size += int(info.i64Size)
+                if result != 0:
+                    return None
+                total_items += int(info.i64NumItems)
+                total_size += int(info.i64Size)
             except Exception:
-                continue
+                return None
         return (total_items, total_size)
 
     def _get_drive_total_bytes(self, path: Path) -> Optional[int]:
@@ -719,7 +738,11 @@ class DiskScoutApp(App):
                 if rp.is_dir():
                     return int(
                         DiskScanner(
+                            include_ext=self.include_ext,
+                            exclude_ext=self.exclude_ext,
                             ignore_paths=self.ignore_paths,
+                            max_depth=self.max_depth,
+                            follow_symlinks=self.follow_symlinks,
                             use_default_ignores=self.use_default_ignores,
                         ).scan(str(rp), top_n=0)['total_size']
                     )
@@ -780,7 +803,11 @@ class DiskScoutApp(App):
             if rp.is_dir():
                 return int(
                     DiskScanner(
+                        include_ext=self.include_ext,
+                        exclude_ext=self.exclude_ext,
                         ignore_paths=self.ignore_paths,
+                        max_depth=self.max_depth,
+                        follow_symlinks=self.follow_symlinks,
                         use_default_ignores=self.use_default_ignores,
                     ).scan(str(rp), top_n=0)['total_size']
                 )

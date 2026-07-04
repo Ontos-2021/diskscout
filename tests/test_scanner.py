@@ -96,3 +96,19 @@ def test_scan_tolerates_paths_that_fail_to_resolve(monkeypatch, tmp_path):
 
     assert result["file_count"] == 1
     assert result["total_size"] == 5
+
+
+def test_scan_records_walk_errors(monkeypatch, tmp_path):
+    def fake_walk(root_path, topdown=True, onerror=None, followlinks=False):
+        error = PermissionError("denied")
+        error.filename = str(tmp_path / "restricted")
+        onerror(error)
+        yield str(root_path), [], []
+
+    monkeypatch.setattr(scanner_module.os, "walk", fake_walk)
+
+    result = DiskScanner().scan(tmp_path)
+
+    assert len(result["errors"]) == 1
+    assert "Error accessing" in result["errors"][0]
+    assert str(tmp_path / "restricted") in result["errors"][0]

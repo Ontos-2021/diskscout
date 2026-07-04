@@ -1,11 +1,6 @@
 import argparse
 import csv
 import json
-import sys
-from pathlib import Path
-
-# Add parent directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.scanner import DiskScanner
 from core.utils import (
@@ -30,6 +25,29 @@ def add_scan_filters(parser):
         '--no-default-ignores',
         action='store_true',
         help='Include common development artifacts such as .git, venv and __pycache__.',
+    )
+    parser.add_argument(
+        '--include-ext',
+        action='append',
+        default=[],
+        help='Only include files with this extension (for example .log). Repeat for multiple values.',
+    )
+    parser.add_argument(
+        '--exclude-ext',
+        action='append',
+        default=[],
+        help='Exclude files with this extension (for example .tmp). Repeat for multiple values.',
+    )
+    parser.add_argument(
+        '--max-depth',
+        type=int,
+        default=None,
+        help='Maximum directory depth to scan, relative to the root.',
+    )
+    parser.add_argument(
+        '--follow-symlinks',
+        action='store_true',
+        help='Follow symbolic links while scanning.',
     )
 
 
@@ -77,7 +95,11 @@ def build_scanner(args):
     options = resolve_scan_options(args)
     return DiskScanner(
         min_size=getattr(args, 'min_size', 0),
+        include_ext=getattr(args, 'include_ext', None),
+        exclude_ext=getattr(args, 'exclude_ext', None),
         ignore_paths=options['ignore_paths'],
+        max_depth=getattr(args, 'max_depth', None),
+        follow_symlinks=getattr(args, 'follow_symlinks', False),
         use_default_ignores=options['use_default_ignores'],
     )
 
@@ -164,7 +186,7 @@ def main():
 
     if args.command == 'scan':
         scanner = build_scanner(args)
-        results = scanner.scan(args.path)
+        results = scanner.scan(args.path, top_n=None if args.save else 20)
         if args.json:
             print(json.dumps(results, indent=2))
         else:
@@ -222,6 +244,10 @@ def main():
             args.path,
             lang=args.lang,
             ignore_paths=options['ignore_paths'],
+            include_ext=args.include_ext,
+            exclude_ext=args.exclude_ext,
+            max_depth=args.max_depth,
+            follow_symlinks=args.follow_symlinks,
             use_default_ignores=options['use_default_ignores'],
         )
         app.run()
